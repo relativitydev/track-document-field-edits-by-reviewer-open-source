@@ -1,0 +1,212 @@
+<script>
+	<name>Populate Reviewed By/On Fields for Historical Edits</name>
+	<version>5.5</version>
+	<description>This Relativity workspace script will populate the selected Reviewed On/By fields with the reviewer and time stamp that the document was edited by for documents located in the selected 
+
+Saved Search.  If the input "Track Initial Change Only?" is set to "Yes", only the document's first edit to the selected field will be tracked.  If it is set to "No", only the document's most recent edit to the selected field will be tracked.</description>
+	<category>Case Functionality</category>
+	<input>
+		<search id="savedSearch" name="Saved Search:" />
+		<sql id="fieldToMonitor" name="Field To Monitor:">
+			SELECT 
+				ID = ArtifactID,
+				Display = DisplayName
+			FROM [Field] WITH(NOLOCK)
+			WHERE FieldTypeID IN (5,8,3)
+				AND FieldCategoryID = 0
+				AND FieldArtifactTypeID = 10
+			ORDER BY DisplayName
+		</sql>
+		<field id="userField" name="Reviewed By User Field:">
+			<filters>
+				<type>11</type>
+				<category>0</category>
+			</filters>
+		</field>
+		<field id="dateField" name="Reviewed On Date Field:">
+			<filters>
+				<type>2</type>
+				<category>0</category>
+			</filters>
+		</field>
+		<constant id="initialChangeOnly" name="Track Initial Change Only?" type="text">
+			<option>Yes</option>
+			<option>No</option>
+		</constant>
+	</input>
+	<action returns="table" timeout="3600"><![CDATA[
+
+--Drop and Create Temp Tables
+IF OBJECT_ID('tempdb..#AuditRecordIDs') IS NOT NULL 
+	BEGIN  
+		DROP TABLE #AuditRecordIDs
+	END
+	CREATE TABLE #AuditRecordIDs (ID INT)
+
+IF OBJECT_ID('tempdb..#SelectedFieldRecords') IS NOT NULL 
+	BEGIN  
+		DROP TABLE #SelectedFieldRecords
+	END
+	CREATE TABLE #SelectedFieldRecords (ID INT, UserID INT, ArtifactID INT, [TimeStamp] DATETIME)
+
+IF OBJECT_ID('tempdb..#Saved_Search_Docs') IS NOT NULL 
+	BEGIN  
+		DROP TABLE #Saved_Search_Docs
+	END
+	CREATE TABLE #Saved_Search_Docs (ArtifactID INT)
+
+IF #initialChangeOnly# = 'Yes' BEGIN
+	IF OBJECT_ID('tempdb..#FirstEdits') IS NOT NULL 
+		BEGIN  
+			DROP TABLE #FirstEdits 
+		END
+		CREATE TABLE #FirstEdits (ID INT)
+
+	IF OBJECT_ID('tempdb..#DocumentsToUpdate_First') IS NOT NULL 
+		BEGIN  
+			DROP TABLE #DocumentsToUpdate_First
+		END
+		CREATE TABLE #DocumentsToUpdate_First (ID INT, ArtifactID INT, UserID INT, [TimeStamp] DATETIME)
+		
+
+	IF OBJECT_ID('tempdb..#Batch_First') IS NOT NULL 
+		BEGIN  
+			DROP TABLE #Batch_First
+		END
+		CREATE TABLE #Batch_First (ID INT, ArtifactID INT, UserID INT, [TimeStamp] DATETIME)
+		CREATE INDEX #IX_Batch_First_ArtifactID ON #Batch_First(ID, ArtifactID)
+END
+
+IF #initialChangeOnly# = 'No' BEGIN
+	IF OBJECT_ID('tempdb..#LastEdits') IS NOT NULL 
+		BEGIN  
+			DROP TABLE #LastEdits
+		END
+		CREATE TABLE #LastEdits (ID INT)
+
+	IF OBJECT_ID('tempdb..#DocumentsToUpdate_Last') IS NOT NULL 
+		BEGIN  
+			DROP TABLE #DocumentsToUpdate_Last
+		END
+		CREATE TABLE #DocumentsToUpdate_Last (ID INT, ArtifactID INT, UserID INT, [TimeStamp] DATETIME)
+
+	IF OBJECT_ID('tempdb..#Batch_Last') IS NOT NULL 
+		BEGIN  
+			DROP TABLE #Batch_Last
+		END
+		CREATE TABLE #Batch_Last (ID INT, ArtifactID INT, UserID INT, [TimeStamp] DATETIME)
+		CREATE INDEX #IX_Batch_Last_IdArtifactID ON #Batch_Last(ID, ArtifactID)
+END
+
+DECLARE @batch INT = 50000
+
+--Get All Document ID's from the Saved Search
+INSERT INTO #Saved_Search_Docs
+SELECT
+	[Document].[ArtifactID]
+#savedSearch#
+
+--Get All Document Edits where the user still exists on the case
+INSERT INTO #AuditRecordIDs
+SELECT AR.ID
+FROM AuditRecord AR WITH(NOLOCK)
+	INNER JOIN #MasterDatabasePrepend#UserCaseUser UCU WITH(NOLOCK) ON AR.UserID = UCU.CaseUserArtifactID AND UCU.CaseArtifactID = #CaseArtifactID#
+	INNER JOIN #MasterDatabasePrepend#[User] U WITH(NOLOCK) ON UCU.UserArtifactID = U.ArtifactID
+	INNER JOIN #Saved_Search_Docs K ON AR.ArtifactID = K.ArtifactID
+WHERE AR.[Action] = 3
+
+CREATE INDEX #IX_AuditRecordIDs_ID ON #AuditRecordIDs(ID)
+
+--Get All Document Edits for the selected field
+DECLARE @offset INT 
+SET @offset = (SELECT DATEDIFF(HOUR,GetUTCDate(), GetDate()))
+
+INSERT INTO #SelectedFieldRecords
+SELECT AR.ID, AR.UserID, AR.ArtifactID, DATEADD(HOUR,@offset,AR.[TimeStamp]) [TimeStamp]
+FROM #AuditRecordIDs K WITH(NOLOCK)
+	INNER JOIN AuditRecord AR WITH(NOLOCK) ON K.ID = AR.ID
+WHERE AR.Details LIKE '%<field id="'+CAST(#fieldToMonitor# AS VARCHAR)+'%'
+
+CREATE INDEX #i_SelectedFieldRecords ON #SelectedFieldRecords(ID, ArtifactID)
+
+IF #initialChangeOnly# = 'Yes' 
+	BEGIN
+		--Get First Edit Per Document
+		INSERT INTO #FirstEdits
+		SELECT MIN(K.ID) ID
+		FROM #SelectedFieldRecords K
+		GROUP BY K.ArtifactID
+		
+		CREATE INDEX #i_FirstEdits_Id ON #FirstEdits(ID)
+		
+		--Get Values to Update to
+		INSERT INTO #DocumentsToUpdate_First
+		SELECT B.ID, B.ArtifactID, B.UserID, B.[TimeStamp]
+		FROM #FirstEdits A
+			INNER JOIN #SelectedFieldRecords B ON A.ID = B.ID
+			
+		CREATE INDEX #i_DocumentsToUpdate_First_IdArtifactID ON #DocumentsToUpdate_First(ID, ArtifactID)
+			
+		--Update Documents in Batches
+		WHILE ISNULL((SELECT TOP 1 ID FROM #DocumentsToUpdate_First),0) > 0
+		BEGIN
+			INSERT INTO #Batch_First
+			SELECT TOP (@batch) ID, ArtifactID, UserID, [TimeStamp]
+			FROM #DocumentsToUpdate_First
+			
+			UPDATE D 
+			SET D.#userField# = K.UserID, D.#dateField# = K.[TimeStamp] 
+			FROM [Document] D
+				INNER JOIN #Batch_First K ON D.ArtifactID = K.ArtifactID
+			
+			DELETE FROM DTU 
+			FROM #DocumentsToUpdate_First DTU 
+				INNER JOIN #Batch_First B 
+					ON B.ID = DTU.ID
+						
+			DELETE FROM #Batch_First
+		END
+	END
+
+IF #initialChangeOnly# = 'No' 
+	BEGIN
+		--Get Last Edit Per Document
+		INSERT INTO #LastEdits
+		SELECT MAX(K.ID) ID
+		FROM #SelectedFieldRecords K
+		GROUP BY K.ArtifactID
+		
+		CREATE INDEX #i_LastEdits_Id ON #LastEdits(ID)
+
+		--Get Values to Update to
+		INSERT INTO #DocumentsToUpdate_Last
+		SELECT B.ID, B.ArtifactID, B.UserID, B.[TimeStamp]
+		FROM #LastEdits A
+			INNER JOIN #SelectedFieldRecords B ON A.ID = B.ID
+			
+		CREATE INDEX #i_DocumentsToUpdate_Last_IdArtifactID ON #DocumentsToUpdate_Last(ID, ArtifactID)
+			
+		--Update Documents in Batches
+		WHILE ISNULL((SELECT TOP 1 ID FROM #DocumentsToUpdate_Last),0) > 0
+		BEGIN
+			INSERT INTO #Batch_Last
+			SELECT TOP (@batch) ID, ArtifactID, UserID, [TimeStamp]
+			FROM #DocumentsToUpdate_Last
+			
+			UPDATE D SET D.#userField# = K.UserID, D.#dateField# = K.[TimeStamp]
+			FROM [Document] D
+				INNER JOIN #Batch_Last K ON D.ArtifactID = K.ArtifactID
+						
+			DELETE FROM DTU 
+			FROM #DocumentsToUpdate_Last DTU 
+				INNER JOIN #Batch_Last B 
+					ON B.ID = DTU.ID
+			
+			DELETE FROM #Batch_Last
+		END
+	END
+
+SELECT 'Update Complete' Result
+
+	]]></action>
+</script>
